@@ -153,8 +153,15 @@ JOB_RETENTION_SECONDS = int(
 # is gone. Lower it only if you would rather lose in-session re-edits than
 # keep the original around. Uploads are deliberately untouched: that file is
 # the user's own content, which they attested to owning.
+# Original uploaded videos are retained for 6 hours (configurable via
+# ORIGINAL_VIDEO_RETENTION_HOURS) after successful processing and deleted ONLY
+# after verifying all generated clips are safely stored.
+ORIGINAL_VIDEO_RETENTION_HOURS = max(
+    1, int(os.environ.get("ORIGINAL_VIDEO_RETENTION_HOURS", "6") or 6)
+)
+ORIGINAL_VIDEO_RETENTION_SECONDS = ORIGINAL_VIDEO_RETENTION_HOURS * 3600
 SOURCE_RETENTION_SECONDS = int(
-    os.environ.get("SOURCE_RETENTION_SECONDS", str(JOB_RETENTION_SECONDS))
+    os.environ.get("SOURCE_RETENTION_SECONDS", str(ORIGINAL_VIDEO_RETENTION_SECONDS))
 )
 # Force full pipeline logs to the client even under billing (local debugging).
 DEBUG_LOGS = os.environ.get("DEBUG_LOGS", "").lower() in ("1", "true", "yes")
@@ -190,23 +197,53 @@ async def _user_from_request(request: Request):
     return await get_current_user_optional(request)
 
 
+def _server_gemini_api_key() -> Optional[str]:
+    """Read Gemini API key exclusively from server-side environment variables.
+
+    Supports GEMINI_API_KEY (standard Render variable) with fallback to
+    MANAGED_GEMINI_API_KEY. Never logs or returns the secret to clients.
+    """
+    key = (
+        os.environ.get("GEMINI_API_KEY", "").strip()
+        or os.environ.get("MANAGED_GEMINI_API_KEY", "").strip()
+    )
+    return key or None
+
+
+def _is_valid_gemini_key_format(api_key: Optional[str]) -> bool:
+    """Basic sanity check before starting expensive video processing.
+    Avoids burning upload/FFmpeg/Whisper work on an empty or placeholder value."""
+    if not api_key:
+        return False
+    cleaned = api_key.strip()
+    if len(cleaned) < 20 or any(ch.isspace() for ch in cleaned):
+        return False
+    lowered = cleaned.lower()
+    if lowered.startswith(("your_", "replace_", "example", "changeme", "todo")):
+        return False
+    return True
+
+
 async def resolve_gemini(request: Request) -> Optional[str]:
     """Resolve the Gemini API key for a request.
 
-    Cloud (hosted) is PAID-ONLY: there is no BYOK for the core pipeline, so the
-    ``X-Gemini-Key`` header is ignored — an entitled user (active plan or trial)
-    gets the managed server key, everyone else gets ``None`` (→ 402, start trial).
-    Self-host keeps BYOK: header wins, else the env fallback.
+    Server-side configuration is always preferred so public app users are never
+    asked to enter their own Gemini API key:
+    - In cloud/public mode (BILLING_ENABLED=true): authenticated & entitled
+      users receive the server-side GEMINI_API_KEY.
+    - In self-hosted mode: uses server-side GEMINI_API_KEY first, with optional
+      X-Gemini-Key header fallback for legacy BYOK self-hosters.
     """
     if BILLING_ENABLED:
         user = await _user_from_request(request)
         if managed_keys.has_active_entitlement(user):
-            return managed_keys.gemini_key()
+            return managed_keys.gemini_key() or _server_gemini_api_key()
         return None
-    header = request.headers.get("X-Gemini-Key")
-    if header:
-        return header
-    return os.environ.get("GEMINI_API_KEY")
+    server_key = _server_gemini_api_key()
+    if server_key:
+        return server_key
+    header = (request.headers.get("X-Gemini-Key") or "").strip()
+    return header or None
 
 
 async def resolve_upload_post(request: Request, body_key: Optional[str] = None):
@@ -284,16 +321,57 @@ def payment_required(error: str, message: str, **extra) -> HTTPException:
     })
 
 
-def gemini_missing_error():
-    """The right 4xx when no Gemini key could be resolved.
+def gemini_missing_error(user=None):
+    """Return a safe user-facing HTTPException when Gemini cannot be used.
 
-    402 for a signed-in-but-not-entitled cloud user (needs a plan); 400 otherwise
-    (BYOK header simply missing).
+    Never leaks internal header names or secret diagnostics to public users.
+    Logs a safe internal message (without any key material) for operators.
     """
     if BILLING_ENABLED:
+        if user is None:
+            return HTTPException(
+                status_code=401,
+                detail="Please sign in to generate AI clips.",
+            )
+        if managed_keys.has_active_entitlement(user):
+            print("⚠️ [DIAGNOSTIC] Server GEMINI_API_KEY is missing or invalid in environment.")
+            return HTTPException(
+                status_code=503,
+                detail="AI video processing is temporarily unavailable. Please try again later.",
+            )
         return payment_required(
-            "no_plan", "This action needs an active OpenShorts plan (or the user's own API key).")
-    return HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
+            "no_plan", "Your available credits are used up. Upgrade your plan to continue generating clips.")
+    print("⚠️ [DIAGNOSTIC] Server GEMINI_API_KEY is missing or invalid. Set GEMINI_API_KEY in server environment variables.")
+    return HTTPException(
+        status_code=503,
+        detail="AI video processing is temporarily unavailable. Please try again later.",
+    )
+
+
+# Public API abuse / cost protection rate limits (in-memory sliding window).
+_api_rate_hits: dict = {}
+PROCESS_RATE_LIMIT_PER_HOUR = max(1, int(os.environ.get("PROCESS_RATE_LIMIT_PER_HOUR", "20") or 20))
+UPLOAD_RATE_LIMIT_PER_HOUR = max(1, int(os.environ.get("UPLOAD_RATE_LIMIT_PER_HOUR", "30") or 30))
+
+
+def _rate_identity(request: Request, user_id=None) -> str:
+    if user_id is not None:
+        return f"user:{user_id}"
+    fwd = request.headers.get("x-forwarded-for")
+    ip = fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "unknown")
+    return f"ip:{ip}"
+
+
+def _enforce_rate_limit(bucket: str, limit: int, window_seconds: int = 3600):
+    now = time.monotonic()
+    hits = [t for t in _api_rate_hits.get(bucket, []) if now - t < window_seconds]
+    if len(hits) >= limit:
+        raise HTTPException(
+            status_code=429,
+            detail="You have reached the hourly processing limit. Please wait a little while and try again.",
+        )
+    hits.append(now)
+    _api_rate_hits[bucket] = hits
 
 
 # Probe rate limiter. In-memory, resets on restart by design — the hard monthly
@@ -897,27 +975,29 @@ async def require_managed_entitlement(request):
 
 
 async def _owner_id(request):
-    """The authenticated cloud user's id to stamp on a new job/session, or None
-    for self-host / BYOK / anonymous (BILLING off → nothing to scope)."""
+    """The authenticated user's id to stamp on a new job/session, or None
+    for anonymous BYOK callers."""
     if not BILLING_ENABLED:
-        return None
+        try:
+            import local_auth as _local_auth
+            return _local_auth.get_user_id_from_request(request)
+        except Exception:
+            return None
     user = await _user_from_request(request)
     return user.id if user else None
 
 
 async def _assert_job_owner(request, record):
-    """Cloud multi-tenant guard: reject unless the caller owns this in-memory
-    job/session record.
-
-    No-op for self-host (BILLING off) and for records with no owner stamped
-    (BYOK / self-host jobs never set ``user_id``). Returns 404 rather than 403 so
-    a non-owner can't even confirm the id exists. UUID ids already make these
-    stores hard to enumerate; this closes the gap for a shared/leaked id.
-    """
-    if not BILLING_ENABLED:
-        return
+    """Multi-tenant guard: reject unless the caller owns this in-memory
+    job/session record. Returns 404 rather than 403 so a non-owner can't
+    confirm the id exists."""
     owner = record.get("user_id") if isinstance(record, dict) else None
     if owner is None:
+        return
+    if not BILLING_ENABLED:
+        caller = await _owner_id(request)
+        if caller != str(owner):
+            raise HTTPException(status_code=404, detail="Not found")
         return
     # Compare as strings: live jobs store a uuid.UUID, but jobs recovered from
     # the .owner sidecar store its string form — UUID != str is always True.
@@ -3013,14 +3093,89 @@ def _sweep_expired_job_dirs(now):
         jobs.pop(job_id, None)
 
 
+def _mark_job_completed(job_dir: str):
+    """Record completion timestamp on disk so 6-hour original video cleanup
+    measures from successful processing completion rather than upload time."""
+    try:
+        marker = os.path.join(job_dir, ".completed_at")
+        with open(marker, "w") as f:
+            f.write(str(time.time()))
+    except OSError:
+        pass
+
+
+def _job_completed_at(job_id: str) -> Optional[float]:
+    if not job_id or not _JOB_ID_RE.match(job_id):
+        return None
+    marker = os.path.join(OUTPUT_DIR, job_id, ".completed_at")
+    try:
+        with open(marker, "r") as f:
+            return float(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _clips_safely_stored_for_job(job_id: str) -> bool:
+    """Return True ONLY when all generated clips for ``job_id`` are verified
+    safely stored (in R2 when R2 is configured, or non-empty files on disk
+    otherwise). Original uploaded videos must NEVER be deleted before this
+    verification passes."""
+    if not job_id or not _JOB_ID_RE.match(job_id):
+        return False
+    job_dir = os.path.join(OUTPUT_DIR, job_id)
+    if not os.path.isdir(job_dir):
+        return False
+    # If cloud R2 storage is active, require explicit verified-archive marker
+    # written after archive_job + verify_job_clips_stored succeeded.
+    if BILLING_ENABLED and cloud is not None and cloud.settings.r2_configured:
+        r2_marker = os.path.join(job_dir, ".r2_verified")
+        if not os.path.isfile(r2_marker):
+            return False
+        return True
+    # Local/self-hosted verification: confirm metadata lists clips and every
+    # clip file exists with non-zero bytes.
+    metas = glob.glob(os.path.join(job_dir, "*_metadata.json"))
+    if not metas:
+        return False
+    try:
+        with open(metas[0], "r") as f:
+            data = json.load(f)
+        clips = data.get("clips") or []
+        if not clips:
+            return False
+        for clip in clips:
+            fname = os.path.basename(str(clip.get("filename") or clip.get("file") or ""))
+            if not fname:
+                continue
+            cpath = os.path.join(job_dir, fname)
+            if not os.path.isfile(cpath) or os.path.getsize(cpath) <= 0:
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def _sweep_expired_uploads(now):
-    """Drop source uploads older than JOB_RETENTION_SECONDS, except the source
-    of a job that is still queued or running."""
+    """Drop original uploaded videos once ORIGINAL_VIDEO_RETENTION_SECONDS (6h)
+    have elapsed after successful processing AND all generated clips are
+    verified safely stored. Abandoned/unowned uploads expire after
+    JOB_RETENTION_SECONDS."""
     for filename in os.listdir(UPLOAD_DIR):
         file_path = os.path.join(UPLOAD_DIR, filename)
         try:
-            if (now - os.path.getmtime(file_path) > JOB_RETENTION_SECONDS
-                    and not _upload_is_live(filename, now)):
+            if not os.path.isfile(file_path) or _upload_is_live(filename, now):
+                continue
+            job_id = _upload_job_id(filename)
+            completed_at = _job_completed_at(job_id) if job_id else None
+            if completed_at is not None:
+                # 6-hour post-processing retention window + strict clip verification
+                if (now - completed_at >= ORIGINAL_VIDEO_RETENTION_SECONDS
+                        and _clips_safely_stored_for_job(job_id)):
+                    os.remove(file_path)
+                    print(f"🧹 6h retention: deleted verified original upload {filename}")
+                continue
+            # Uncompleted / orphaned upload file (e.g. failed job or stale file)
+            if now - os.path.getmtime(file_path) > JOB_RETENTION_SECONDS:
                 os.remove(file_path)
         except Exception:
             pass
@@ -3111,19 +3266,16 @@ def _enforce_output_size_cap():
 
 
 def _sweep_retained_sources(now=None):
-    """Delete retained downloads older than SOURCE_RETENTION_SECONDS.
-
-    Only the ``source_video`` a URL job kept in its own directory: an upload is
-    the user's own file and ages out with the job like everything else. Yields
-    the job ids it emptied. A no-op unless the knob is set below the job clock.
-    """
-    if SOURCE_RETENTION_SECONDS >= JOB_RETENTION_SECONDS:
-        return
+    """Delete retained source videos older than ORIGINAL_VIDEO_RETENTION_SECONDS
+    (default 6h) after completion, ONLY after verifying all generated clips are
+    safely stored."""
     now = time.time() if now is None else now
     for job_id in os.listdir(OUTPUT_DIR):
         if job_id == os.path.basename(THUMBNAILS_DIR) or _not_a_job_dir(job_id):
             continue
         try:
+            if _job_is_active(job_id, now):
+                continue
             metas = glob.glob(os.path.join(OUTPUT_DIR, job_id, "*_metadata.json"))
             if not metas:
                 continue
@@ -3132,8 +3284,10 @@ def _sweep_retained_sources(now=None):
             if not name:
                 continue
             src = os.path.join(OUTPUT_DIR, job_id, os.path.basename(name))
+            completed_at = _job_completed_at(job_id) or (os.path.getmtime(src) if os.path.exists(src) else now)
             if (os.path.exists(src)
-                    and now - os.path.getmtime(src) > SOURCE_RETENTION_SECONDS):
+                    and now - completed_at >= SOURCE_RETENTION_SECONDS
+                    and _clips_safely_stored_for_job(job_id)):
                 os.remove(src)
                 yield job_id
         except Exception:
@@ -3700,6 +3854,18 @@ async def _archive_managed_job(job_id):
         return
     try:
         await cloud.videos.archive_job(job['user_id'], job_id, clips, job['output_dir'])
+        clip_names = [
+            os.path.basename(str(c.get('filename') or c.get('file') or ''))
+            for c in clips if (c.get('filename') or c.get('file'))
+        ]
+        if await cloud.videos.verify_job_clips_stored(
+            job['user_id'], job_id, clip_names, job['output_dir']
+        ):
+            try:
+                with open(os.path.join(job['output_dir'], ".r2_verified"), "w") as f:
+                    f.write(str(time.time()))
+            except OSError:
+                pass
     except Exception as e:
         print(f"⚠️  R2 archive error for {job_id}: {e}")
     _archive_source_bg(job_id, job)
@@ -4441,6 +4607,12 @@ __import__("logging").getLogger("uvicorn.access").addFilter(_QuietAccessLog())
 # Cloud mode: attach middleware + routers at import time (before the app serves).
 if BILLING_ENABLED:
     cloud.setup_sync(app)
+else:
+    # Standalone public auth (SQLite + scrypt + HS256 JWT + token revocation)
+    # ensures Sign Up / Log In / Log Out / Profile / Delete Account work out
+    # of the box on Render even before PostgreSQL cloud billing is enabled.
+    import local_auth as _local_auth
+    app.include_router(_local_auth.router)
 
 # MCP server (/mcp): the pipeline as agent-callable tools. Works in both modes —
 # cloud requires an osk_ API key, self-host keeps BYOK (see mcp_server.py).
@@ -5083,6 +5255,7 @@ def _finish_job(job_id, returncode, output_dir):
     if returncode == 0:
         jobs[job_id]['status'] = 'completed'
         jobs[job_id]['logs'].append("Process finished successfully.")
+        _mark_job_completed(output_dir)
 
         # Self-host: silent AWS S3 backup. Cloud mode stores to R2 instead
         # (see _archive_managed_job), so skip the redundant/paid AWS upload.
@@ -5665,10 +5838,18 @@ PUBLIC_CONFIG_CACHE = "public, max-age=300"
 @app.get("/api/config")
 async def get_config(response: Response):
     response.headers["Cache-Control"] = PUBLIC_CONFIG_CACHE
+    server_ai_ready = _is_valid_gemini_key_format(
+        cloud.settings.managed_gemini_key if BILLING_ENABLED and cloud is not None else _server_gemini_api_key()
+    )
     return {
         "youtubeUrlEnabled": not DISABLE_YOUTUBE_URL,
         "billingEnabled": BILLING_ENABLED,
+        "authEnabled": True,
         "googleAuthEnabled": bool(BILLING_ENABLED and cloud.settings.google_auth_enabled),
+        "aiConfigured": bool(server_ai_ready or (not BILLING_ENABLED and llm_backend.active())),
+        "r2Configured": bool(BILLING_ENABLED and cloud is not None and cloud.settings.r2_configured),
+        "paymentsConfigured": bool(BILLING_ENABLED and cloud is not None and cloud.settings.stripe_configured),
+        "originalRetentionHours": ORIGINAL_VIDEO_RETENTION_HOURS,
         "jobRetentionSeconds": JOB_RETENTION_SECONDS,
         # Self-host only: tells the dashboard the Gemini key is optional
         # because the moment picker runs on an OpenAI-compatible server.
@@ -5845,7 +6026,8 @@ async def create_upload(request: Request):
     """Reserve an upload slot. Body (JSON, optional): {"filename": "..."}."""
     user_id = await _owner_id(request)
     if BILLING_ENABLED and user_id is None:
-        raise HTTPException(status_code=401, detail="Sign in or use an API key to upload")
+        raise HTTPException(status_code=401, detail="Please sign in to upload videos.")
+    _enforce_rate_limit(f"upload:{_rate_identity(request, user_id)}", UPLOAD_RATE_LIMIT_PER_HOUR)
     try:
         body = await request.json()
     except Exception:
@@ -6069,18 +6251,21 @@ async def process_endpoint(
     auto_hook_style: Optional[str] = Form(None),
     thumbnail_session_id: Optional[str] = Form(None),
     captions: Optional[str] = Form(None),
+    language: Optional[str] = Form(None),
     upload_id: Optional[str] = Form(None),
     max_minutes: Optional[str] = Form(None),
     source_start: Optional[str] = Form(None),
     source_end: Optional[str] = Form(None),
 ):
+    current_user = await _user_from_request(request) if BILLING_ENABLED else None
     api_key = await resolve_gemini(request)
-    if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
-        # Self-host with an OpenAI-compatible server configured needs no
-        # Google key for the core pipeline: the moment picker runs there and
-        # the frame-based stages degrade on their own (layout_picker returns
-        # "none", silent videos fail with a message that says why).
-        raise gemini_missing_error()
+    using_local_llm = bool(llm_backend.active() and not BILLING_ENABLED)
+    if not using_local_llm and not _is_valid_gemini_key_format(api_key):
+        raise gemini_missing_error(current_user)
+    _enforce_rate_limit(
+        f"process:{_rate_identity(request, current_user.id if current_user else None)}",
+        PROCESS_RATE_LIMIT_PER_HOUR,
+    )
 
     ack_flag = str(acknowledged).lower() in ("1", "true", "yes")
     force_low = str(force_low_quality).lower() in ("1", "true", "yes")
@@ -6103,6 +6288,7 @@ async def process_endpoint(
         auto_hook_style = body.get("auto_hook_style")
         thumbnail_session_id = body.get("thumbnail_session_id")
         captions = body.get("captions")
+        language = body.get("language")
         upload_id = body.get("upload_id")
         max_minutes = body.get("max_minutes")
         source_start = body.get("source_start")
@@ -6257,6 +6443,10 @@ async def process_endpoint(
     if captions is not None and str(captions).lower() in ("0", "false", "no"):
         env["AUTO_CAPTIONS"] = "0"
         print(f"[captions] job={job_id} auto-captions off")
+    if language and str(language).strip().lower() in ("en", "hi", "english", "hindi"):
+        lang_code = "hi" if str(language).strip().lower().startswith("hi") else "en"
+        env["TRANSCRIBE_LANGUAGE"] = lang_code
+        env["CLIP_LANGUAGE"] = lang_code
 
     input_path = None
     if url:

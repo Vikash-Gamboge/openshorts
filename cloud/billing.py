@@ -128,13 +128,59 @@ async def _blocking_sub_status(user_id):
 # --------------------------------------------------------------------------- #
 # Endpoints
 # --------------------------------------------------------------------------- #
+_STATIC_PUBLIC_PLANS = [
+    {
+        "kind": "subscription",
+        "price_id": "",
+        "lookup_key": "starter_monthly",
+        "plan": "starter",
+        "interval": "month",
+        "minutes": PLAN_MINUTES["starter"],
+        "amount": 1900,
+        "currency": "usd",
+        "checkout_available": False,
+    },
+    {
+        "kind": "subscription",
+        "price_id": "",
+        "lookup_key": "creator_monthly",
+        "plan": "creator",
+        "interval": "month",
+        "minutes": PLAN_MINUTES["creator"],
+        "amount": 3900,
+        "currency": "usd",
+        "checkout_available": False,
+    },
+    {
+        "kind": "subscription",
+        "price_id": "",
+        "lookup_key": "pro_monthly",
+        "plan": "pro",
+        "interval": "month",
+        "minutes": PLAN_MINUTES["pro"],
+        "amount": 7900,
+        "currency": "usd",
+        "checkout_available": False,
+    },
+]
+
+
 @router.get("/api/billing/plans")
 async def list_plans(response: Response):
-    cat = await get_catalog()
-    # The same catalog for everyone, asked for by every pricing view: the
-    # browser may reuse it for a few minutes.
     response.headers["Cache-Control"] = "public, max-age=300"
-    return {"plans": cat["plans"], "topups": cat["topups"]}
+    if not settings.stripe_configured:
+        return {
+            "plans": _STATIC_PUBLIC_PLANS,
+            "topups": [],
+            "payments_configured": False,
+        }
+    cat = await get_catalog()
+    plans = [{**p, "checkout_available": True} for p in cat["plans"]]
+    return {
+        "plans": plans,
+        "topups": cat["topups"],
+        "payments_configured": True,
+    }
 
 
 # Shown next to Stripe's terms checkbox. Two jobs in one tick: it makes the
@@ -163,6 +209,11 @@ class CheckoutRequest(BaseModel):
 @router.post("/api/billing/checkout")
 async def create_checkout(body: CheckoutRequest, request: Request):
     user = await get_current_user_required(request)
+    if not settings.stripe_configured:
+        raise HTTPException(
+            status_code=503,
+            detail="Online plan upgrades are temporarily unavailable while payment checkout is being configured.",
+        )
     cat = await get_catalog()
     entry = cat["by_id"].get(body.price_id)
     if not entry:

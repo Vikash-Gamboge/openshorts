@@ -42,9 +42,14 @@ FREE_REDO_BLOCK_DAYS = 90
 # normalized, so the plan isn't a multi-account faucet.
 # The 20-minute monthly quota is the only bound on free usage — no daily job
 # cap (it confused users and the minute ledger already caps real cost).
-# Free users' clips expire from R2 after this many days (paid libraries are
-# durable). Also an upgrade lever, mirroring OpusClip's 3-day free exports.
-FREE_CLIP_RETENTION_DAYS = 7
+# Generated clips are kept durably by default (0 = never auto-delete).
+# Set FREE_CLIP_RETENTION_DAYS to a positive integer only if an explicit
+# retention expiry policy is desired for free-tier clips.
+FREE_CLIP_RETENTION_DAYS = max(0, int(os.environ.get("FREE_CLIP_RETENTION_DAYS", "0") or 0))
+# Original uploaded videos are retained for this many hours after successful
+# processing (default: 6h) and deleted only after verifying all generated clips
+# are safely stored.
+ORIGINAL_VIDEO_RETENTION_HOURS = max(1, int(os.environ.get("ORIGINAL_VIDEO_RETENTION_HOURS", "6") or 6))
 
 # Free trial length (days) for new subscriptions. Trials are retired in favor
 # of the free plan; the checkout only injects trial_period_days when > 0, and
@@ -392,6 +397,10 @@ class Settings:
     def stripe_webhook_secret(self) -> str:
         return os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 
+    @property
+    def stripe_configured(self) -> bool:
+        return bool(self.stripe_secret_key.strip())
+
     # AgentLedger (aikount.com) — issues the legally valid Spanish invoice for
     # every Stripe charge; the account page lists them via /api/billing/invoices.
     @property
@@ -407,14 +416,23 @@ class Settings:
         # The Stripe Connect treasury in AgentLedger that holds OpenShorts' customers.
         return os.environ.get("AGENTLEDGER_TREASURY_ID", "720d3b70-3806-4c59-8729-2495b489a771")
 
-    # Managed provider keys (server-owned, only handed to entitled users)
+    # Managed provider keys (server-owned, only handed to entitled users).
+    # Read GEMINI_API_KEY first (standard Render environment variable), falling
+    # back to MANAGED_GEMINI_API_KEY for backward compatibility.
     @property
     def managed_gemini_key(self) -> str:
-        return os.environ.get("MANAGED_GEMINI_API_KEY", "")
+        return (
+            os.environ.get("GEMINI_API_KEY", "").strip()
+            or os.environ.get("MANAGED_GEMINI_API_KEY", "").strip()
+        )
+
+    @property
+    def gemini_configured(self) -> bool:
+        return bool(self.managed_gemini_key)
 
     @property
     def managed_upload_post_key(self) -> str:
-        return os.environ.get("MANAGED_UPLOAD_POST_API_KEY", "")
+        return os.environ.get("MANAGED_UPLOAD_POST_API_KEY", "").strip()
 
     @property
     def openshorts_logo_url(self) -> str:

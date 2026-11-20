@@ -479,8 +479,49 @@ async def history(request: Request):
     return {"videos": items}
 
 
+async def verify_job_clips_stored(user_id, job_id: str, clip_filenames: list[str], output_dir: str) -> bool:
+    """Return True ONLY when every generated clip for ``job_id`` is safely stored.
+
+    When Cloudflare R2 is configured, verifies each clip exists as a non-empty
+    object in R2 (and has a DB record in ``user_videos``). When R2 is not
+    configured, verifies each clip file exists on local storage with size > 0.
+    Used as a hard precondition before deleting the original uploaded video
+    after the 6-hour retention window.
+    """
+    if not clip_filenames:
+        return False
+    if settings.r2_configured and user_id is not None:
+        try:
+            async with database.session() as s:
+                rows = list((await s.execute(
+                    select(UserVideo.r2_key).where(
+                        UserVideo.user_id == user_id,
+                        UserVideo.job_id == job_id,
+                    )
+                )).scalars())
+            if len(rows) < len(clip_filenames):
+                return False
+            for r2_key in rows:
+                sz = await asyncio.to_thread(storage.object_size, r2_key)
+                if not sz or sz <= 0:
+                    return False
+            return True
+        except Exception as e:
+            print(f"⚠️  Could not verify R2 clips for job {job_id}: {e}")
+            return False
+    # Local storage verification fallback when R2 is not configured
+    for name in clip_filenames:
+        path = os.path.join(output_dir, os.path.basename(name))
+        if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+            return False
+    return True
+
+
 async def purge_expired():
-    """Delete R2 videos for users whose subscription ended > grace-period days ago."""
+    """Delete R2 videos for canceled users ONLY when explicitly opted in via
+    AUTO_PURGE_CANCELLED_CLIPS=true. Never deletes generated clips by default."""
+    if os.environ.get("AUTO_PURGE_CANCELLED_CLIPS", "").lower() not in ("1", "true", "yes"):
+        return
     async with database.session() as s:
         # Users with a canceled subscription past the grace period, who still have videos.
         canceled = list((await s.execute(
@@ -495,7 +536,7 @@ async def purge_expired():
         if last_event_at + timedelta(days=VIDEO_RETENTION_GRACE_DAYS) > now:
             continue
         # A canceled Google-authed user is now an entitled FREE user, not a
-        # lapsed one — their library follows the free 7-day per-clip expiry
+        # lapsed one — their library follows the free per-clip expiry
         # (purge_free_expired) instead of the full wipe.
         async with database.session() as s:
             if await metering.is_free_user(s, user_id):
@@ -521,12 +562,13 @@ async def purge_expired():
 
 
 async def purge_free_expired():
-    """Expire free users' clips/projects after FREE_CLIP_RETENTION_DAYS.
+    """Expire free users' clips/projects ONLY when FREE_CLIP_RETENTION_DAYS > 0.
 
-    Paid libraries are durable; the free plan keeps R2 storage bounded (and the
-    limited retention is an upgrade lever). Only rows whose owner is currently
-    on the free plan are touched — a user who upgraded keeps everything.
+    Defaults to 0 (disabled) so generated clips are never deleted automatically
+    unless an explicit retention policy is configured.
     """
+    if FREE_CLIP_RETENTION_DAYS <= 0:
+        return
     from datetime import datetime, timezone
     cutoff = datetime.now(timezone.utc) - timedelta(days=FREE_CLIP_RETENTION_DAYS)
     async with database.session() as s:
@@ -579,15 +621,11 @@ async def purge_free_expired():
 async def warn_free_expiring():
     """Email free users whose clips enter their LAST day before deletion.
 
-    The 7-day free retention is the plan's strongest honest upgrade lever, but
-    silently deleting clips converts nobody — the user never learns they were
-    at risk. One email on day 6 turns the real deadline into a visible one.
-
-    "Already warned" is recorded in clip_expiry_warnings rather than in memory.
-    The warning window is a full day and this sweep runs every six hours, so a
-    process-local set meant any deploy inside that window re-mailed everyone who
-    had already been told.
+    Skipped automatically when FREE_CLIP_RETENTION_DAYS <= 0 (generated clips
+    are not auto-deleted).
     """
+    if FREE_CLIP_RETENTION_DAYS <= 0:
+        return
     from datetime import datetime, timezone
     from .emails import send_clips_expiring_email
     now = datetime.now(timezone.utc)

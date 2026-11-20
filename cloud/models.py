@@ -50,6 +50,11 @@ class User(Base):
     # cloud/database._ADDITIVE_COLUMNS.
     ban_reason = Column(Text, nullable=True)
     banned_at = Column(DateTime(timezone=True), nullable=True)
+    # Public mobile/web email+password authentication & session revocation.
+    # Added to existing databases via cloud/database._ADDITIVE_COLUMNS.
+    display_name = Column(Text, nullable=True)
+    password_hash = Column(Text, nullable=True)
+    token_version = Column(Integer, nullable=False, server_default="0", default=0)
 
 
 class MagicLinkToken(Base):

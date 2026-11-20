@@ -824,6 +824,18 @@ async def reserve_minutes(user_id, minutes: float, job_id: str, job_type: str = 
             locked_user = (await session.execute(
                 select(User).where(User.id == user_id).with_for_update()
             )).scalar_one_or_none()
+            # Idempotency guard: if this job_id already has a live reservation
+            # (reserved/committed) for this user, return it without deducting twice.
+            existing_row = (await session.execute(
+                select(UsageLedger).where(and_(
+                    UsageLedger.user_id == user_id,
+                    UsageLedger.job_id == job_id,
+                    UsageLedger.job_type == job_type,
+                    UsageLedger.status.in_(("reserved", "committed")),
+                )).limit(1)
+            )).scalar_one_or_none()
+            if existing_row is not None:
+                return str(existing_row.id)
             b = await _balance(session, user_id, user=locked_user)
             plan_remaining = b["_plan_remaining_d"]
             remaining_total = _D(b["remaining"])

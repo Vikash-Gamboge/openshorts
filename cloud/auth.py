@@ -50,10 +50,11 @@ def _now():
 # --------------------------------------------------------------------------- #
 # JWT + current user
 # --------------------------------------------------------------------------- #
-def issue_jwt(user_id, email) -> str:
+def issue_jwt(user_id, email, token_version: int = 0) -> str:
     payload = {
         "sub": str(user_id),
         "email": email,
+        "tv": int(token_version or 0),
         "exp": _now() + timedelta(days=JWT_TTL_DAYS),
         "iat": _now(),
     }
@@ -67,6 +68,70 @@ def _decode_jwt(token: str) -> Optional[dict]:
         return None
 
 
+# --------------------------------------------------------------------------- #
+# Password hashing (stdlib scrypt — salted, constant-time compare)
+# --------------------------------------------------------------------------- #
+_PASSWORD_MIN_LEN = 8
+_PASSWORD_MAX_LEN = 128
+_SCRYPT_N = 2 ** 14
+_SCRYPT_R = 8
+_SCRYPT_P = 1
+_AUTH_RATE_WINDOW_SEC = 15 * 60
+_AUTH_LOGIN_LIMIT_PER_IP = 20
+_AUTH_SIGNUP_LIMIT_PER_IP = 10
+_auth_attempts: dict = {}
+
+
+def _check_auth_rate(bucket: str, limit: int):
+    now = time.monotonic()
+    hits = [t for t in _auth_attempts.get(bucket, []) if now - t < _AUTH_RATE_WINDOW_SEC]
+    if len(hits) >= limit:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many attempts. Please wait a few minutes and try again.",
+        )
+    hits.append(now)
+    _auth_attempts[bucket] = hits
+
+
+def hash_password(password: str) -> str:
+    """Hash a plaintext password using salted scrypt (no third-party C deps)."""
+    salt = secrets.token_bytes(16)
+    dk = hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt,
+        n=_SCRYPT_N,
+        r=_SCRYPT_R,
+        p=_SCRYPT_P,
+        dklen=32,
+    )
+    return f"scrypt${_SCRYPT_N}${_SCRYPT_R}${_SCRYPT_P}${salt.hex()}${dk.hex()}"
+
+
+def verify_password(password: str, stored_hash: Optional[str]) -> bool:
+    """Verify a password against a stored salted scrypt hash in constant time."""
+    if not password or not stored_hash:
+        return False
+    try:
+        parts = stored_hash.split("$")
+        if len(parts) != 6 or parts[0] != "scrypt":
+            return False
+        n, r, p = int(parts[1]), int(parts[2]), int(parts[3])
+        salt = bytes.fromhex(parts[4])
+        expected = bytes.fromhex(parts[5])
+        actual = hashlib.scrypt(
+            password.encode("utf-8"),
+            salt=salt,
+            n=n,
+            r=r,
+            p=p,
+            dklen=len(expected),
+        )
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+
 class CurrentUser:
     """Lightweight per-request user snapshot carried through endpoints.
 
@@ -74,12 +139,15 @@ class CurrentUser:
     ``managed_keys.has_active_entitlement`` can read it without awaiting.
     """
 
-    def __init__(self, id, email, entitled=False, plan=None, upload_post_profile=None):
+    def __init__(self, id, email, entitled=False, plan=None, upload_post_profile=None,
+                 display_name=None, token_version=0):
         self.id = id
         self.email = email
         self.entitled = entitled
         self.plan = plan
         self.upload_post_profile = upload_post_profile
+        self.display_name = display_name
+        self.token_version = int(token_version or 0)
 
 
 SUSPENDED_DETAIL = "This account is suspended. Contact info@openshorts.app."
@@ -104,7 +172,7 @@ async def _load_current_user(session, user_id) -> Optional["CurrentUser"]:
     )
     profile = await session.get(UploadPostProfile, user_id)
     # Entitled to managed keys with an active plan, any top-up credit, or the
-    # free monthly allowance (Google-authenticated accounts only).
+    # free monthly allowance (Google or permanent email accounts).
     free = sub is None and metering.free_plan_eligible(user)
     entitled = bool(sub is not None or topup_remaining > 0 or free)
     return CurrentUser(
@@ -113,6 +181,8 @@ async def _load_current_user(session, user_id) -> Optional["CurrentUser"]:
         entitled=entitled,
         plan=sub.plan if sub else ("free" if free else None),
         upload_post_profile=profile.profile_username if profile else None,
+        display_name=getattr(user, "display_name", None),
+        token_version=int(getattr(user, "token_version", 0) or 0),
     )
 
 
@@ -215,14 +285,17 @@ async def get_current_user_optional(request: Request) -> Optional[CurrentUser]:
         user_id = uuid.UUID(payload["sub"])
     except Exception:
         return None
+    token_tv = int(payload.get("tv", 0) or 0)
     cacheable = _cacheable(request)
     if cacheable:
         hit = _cached_user(user_id)
         if hit is not None:
-            return hit
+            return hit if int(getattr(hit, "token_version", 0) or 0) == token_tv else None
     async with database.session() as session:
         current = await _refuse_banned(session, user_id,
                                        await _load_current_user(session, user_id))
+    if current is not None and int(getattr(current, "token_version", 0) or 0) != token_tv:
+        return None
     if cacheable:
         _remember_user(user_id, current)
     return current
@@ -558,6 +631,166 @@ async def review_login(payload: ReviewLoginRequest, request: Request = None):
 
 
 # --------------------------------------------------------------------------- #
+# Public Mobile / Web Email + Password Sign Up, Login, and Logout
+# --------------------------------------------------------------------------- #
+class PasswordSignupRequest(BaseModel):
+    email: EmailStr
+    password: str
+    display_name: Optional[str] = None
+
+
+class PasswordLoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+def _client_ip(request: Optional[Request]) -> str:
+    if request is None:
+        return "unknown"
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+@router.post("/api/auth/signup")
+async def password_signup(payload: PasswordSignupRequest, request: Request):
+    """Create a new user account with email and password and issue a JWT."""
+    ip = _client_ip(request)
+    _check_auth_rate(f"signup:{ip}", _AUTH_SIGNUP_LIMIT_PER_IP)
+
+    email = email_policy.normalize_email(str(payload.email))
+    if email_policy.is_disposable(email):
+        raise HTTPException(
+            status_code=400,
+            detail="Please use a permanent email address to create an account.",
+        )
+    password = payload.password or ""
+    if len(password) < _PASSWORD_MIN_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Password must be at least {_PASSWORD_MIN_LEN} characters long.",
+        )
+    if len(password) > _PASSWORD_MAX_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail="Password is too long.",
+        )
+    display_name = (payload.display_name or "").strip()[:80] or None
+    pw_hash = hash_password(password)
+
+    async with database.session() as session:
+        async with session.begin():
+            existing = (await session.execute(
+                select(User).where(User.email == email)
+            )).scalar_one_or_none()
+            if existing is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="An account with this email already exists. Please log in instead.",
+                )
+            # Reuse the existing recent-deletion check so re-registering cannot
+            # reset free credits endlessly.
+            from .account import was_recently_deleted
+            denied = "recreated_after_deletion" if await was_recently_deleted(session, email) else None
+            user = User(
+                email=email,
+                display_name=display_name,
+                password_hash=pw_hash,
+                token_version=0,
+                last_login_at=_now(),
+                free_plan_denied=denied,
+            )
+            session.add(user)
+            await session.flush()
+            user_id, user_email, tv = user.id, user.email, int(user.token_version or 0)
+
+        token = issue_jwt(user_id, user_email, token_version=tv)
+        cu = await _load_current_user(session, user_id)
+        bal = await metering._balance(session, user_id)
+
+    evidence.record_event(user_id=user_id, email=user_email, kind="login",
+                          method="password_signup", request=request)
+    return {
+        "token": token,
+        "user": {
+            "id": str(user_id),
+            "email": user_email,
+            "display_name": cu.display_name,
+            "entitled": cu.entitled,
+            "plan": bal["plan"],
+        },
+        "minutes": {
+            "plan_allowance": bal["plan_allowance"],
+            "plan_used": bal["plan_used"],
+            "plan_remaining": bal["plan_remaining"],
+            "topup_remaining": bal["topup_remaining"],
+            "remaining": bal["remaining"],
+        },
+    }
+
+
+@router.post("/api/auth/login")
+async def password_login(payload: PasswordLoginRequest, request: Request):
+    """Authenticate an existing user with email and password and issue a JWT."""
+    ip = _client_ip(request)
+    email = email_policy.normalize_email(str(payload.email))
+    _check_auth_rate(f"login:{ip}", _AUTH_LOGIN_LIMIT_PER_IP)
+    _check_auth_rate(f"login_email:{email}", _AUTH_LOGIN_LIMIT_PER_IP)
+
+    async with database.session() as session:
+        async with session.begin():
+            user = (await session.execute(
+                select(User).where(User.email == email)
+            )).scalar_one_or_none()
+            if user is None or not verify_password(payload.password or "", user.password_hash):
+                raise HTTPException(status_code=401, detail="Invalid email or password.")
+            if is_banned(user):
+                raise HTTPException(status_code=403, detail=SUSPENDED_DETAIL)
+            user.last_login_at = _now()
+            user_id, user_email = user.id, user.email
+            tv = int(getattr(user, "token_version", 0) or 0)
+
+        token = issue_jwt(user_id, user_email, token_version=tv)
+        cu = await _load_current_user(session, user_id)
+        bal = await metering._balance(session, user_id)
+
+    evidence.record_event(user_id=user_id, email=user_email, kind="login",
+                          method="password", request=request)
+    return {
+        "token": token,
+        "user": {
+            "id": str(user_id),
+            "email": user_email,
+            "display_name": cu.display_name,
+            "entitled": cu.entitled,
+            "plan": bal["plan"],
+        },
+        "minutes": {
+            "plan_allowance": bal["plan_allowance"],
+            "plan_used": bal["plan_used"],
+            "plan_remaining": bal["plan_remaining"],
+            "topup_remaining": bal["topup_remaining"],
+            "remaining": bal["remaining"],
+        },
+    }
+
+
+@router.post("/api/auth/logout")
+async def logout(request: Request):
+    """Revoke all active session JWTs for the current user server-side."""
+    user = await get_current_user_required(request)
+    async with database.session() as session:
+        async with session.begin():
+            row = await session.get(User, user.id)
+            if row is not None:
+                row.token_version = int(getattr(row, "token_version", 0) or 0) + 1
+    forget_current_user(user.id)
+    _owner_cache.forget_user(user.id)
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------- #
 # Signup attribution
 # --------------------------------------------------------------------------- #
 class AttributionPayload(BaseModel):
@@ -644,7 +877,11 @@ async def get_me(request: Request):
         attention = None
     shown = sub or attention
     return {
-        "user": {"id": str(user.id), "email": user.email},
+        "user": {
+            "id": str(user.id),
+            "email": user.email,
+            "display_name": user.display_name,
+        },
         "entitled": user.entitled,
         "plan": bal["plan"],
         "status": shown.status if shown else None,
@@ -667,6 +904,8 @@ async def get_me(request: Request):
             "topup_remaining": bal["topup_remaining"],
             "remaining": bal["remaining"],
         },
+        "storage_provider": "r2" if settings.r2_configured else "local",
+        "original_retention_hours": config.ORIGINAL_VIDEO_RETENTION_HOURS,
         "upload_post_profile": user.upload_post_profile,
         "onboarding_survey_pending": survey_pending,
     }

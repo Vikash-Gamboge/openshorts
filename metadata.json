@@ -1,0 +1,8 @@
+{
+  "name": "Pro Clipping Master",
+  "description": "Native Android AI video clipping dashboard designed for connecting to an OpenShorts backend to create 9:16 vertical shorts with highlight detection and automatic subtitles.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -32,6 +32,10 @@ _ADDITIVE_COLUMNS = (
     # Month on hold from the cancel flow (cloud/cancellation, config.ON_HOLD).
     "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS hold_from TIMESTAMPTZ",
     "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS hold_until TIMESTAMPTZ",
+    # Mobile/public email+password auth & server-side logout revocation.
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0",
 )
 
 
